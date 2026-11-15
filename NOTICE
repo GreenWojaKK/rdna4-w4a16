@@ -1,8 +1,8 @@
-d3-rdna4
+rdna4-w4a16
 Copyright 2026 GreenWojaKK
 
 This product adapts kernels from the d3 package, licensed under the Apache License 2.0:
 d3-ultra (Decision 3.0)
 Copyright 2026 vLLM Semantic Router Team
 
-Changes are described at the top of d3_rdna4.py.
+Changes are described at the top of d3_varlen.py.

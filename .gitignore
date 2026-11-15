@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 .venv/
 models/
+AGENTS.md
+*.so
+/dist/
+/record/target/

@@ -1,0 +1,5 @@
+# The toolchain TPUI builds with.
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

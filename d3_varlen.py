@@ -1,4 +1,4 @@
-"""A flat text path for the vLLM d3 decision model on ROCm, written for RDNA 4 (gfx12).
+"""A variable-length text path for the vLLM d3 decision model on ROCm, written for RDNA 4 (gfx12).
 
 - Prompts are joined into one row without padding. Their boundaries are kept by the Gated DeltaNet's cu_seqlens, the
   conv positions and per-prompt attention, so one forward answers the whole batch.
@@ -172,11 +172,17 @@ def token_chunks(lengths, budget=TOKEN_BUDGET):
     return chunks
 
 
-class FlatDecider:
-    """Answers text requests through one flat forward. Requests run one at a time per loaded model."""
+class VarlenDecider:
+    """Answers text requests through one forward over their prompts joined without padding. Requests run one at a time
+    per loaded model.
 
-    def __init__(self, model, exact=False):
+    state_prefix is the text every state starts with, if any. The fixed text reused across requests then extends to the
+    end of it.
+    """
+
+    def __init__(self, model, exact=False, state_prefix=""):
         self.model = model
+        self.state_prefix = state_prefix
         self.lm = model.backbone.language_model
         self.kernels = d3_fast.kernels_next_to_this_file()
         self.fused = rt.FusedStateOnce(self.lm, self.kernels)
@@ -209,11 +215,11 @@ class FlatDecider:
                 module.__dict__.pop("forward", None)
 
     def fixed_tokens(self, questions):
-        """The prompt tokens before the state, which every request with these questions shares."""
+        """The prompt tokens before the state and its state_prefix, which every request with these questions shares."""
         key = json.dumps(questions, ensure_ascii=False, sort_keys=True)
         if key not in self.fixed:
             question = next(iter(questions))
-            first, second = (self.model.prepare(word, questions).sequences.get(question, []) for word in "AB")
+            first, second = (self.model.prepare(f"{self.state_prefix}{word}", questions).sequences.get(question, []) for word in "AB")
             self.fixed[key] = first[:common_prefix([first, second], min(len(first), len(second)))]
         return self.fixed[key]
 

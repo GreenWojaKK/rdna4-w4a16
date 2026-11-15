@@ -1,0 +1,18 @@
+[package]
+name = "rdna4-w4a16-record"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+description = "The record format of the rdna4-w4a16 developer mode: its names, its reader and its totals"
+
+[dependencies]
+# The release TPUI's workspace uses, so a viewer that reads these records builds it once.
+serde_json = "1.0.154"
+
+# Keeps debug builds small, as TPUI's do: line numbers for this crate, no debug info for dependencies.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
