@@ -3,6 +3,8 @@ __pycache__/
 .venv/
 models/
 AGENTS.md
+STATE.md
 *.so
 /dist/
 /record/target/
+/tests/

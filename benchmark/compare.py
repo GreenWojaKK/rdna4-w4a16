@@ -14,12 +14,15 @@ weights.
 Arguments: the d3-ultra-INT4 folder (for the checkpoint's Int4Linear), dist/librdna4_w4a16.so, the output JSON path.
 The Python environment needs ROCm PyTorch and vLLM. report.py prints the result.
 """
-import ctypes
 import json
 import math
 import statistics
 import sys
 import time
+from pathlib import Path as FilePath
+
+sys.path.insert(0, str(FilePath(__file__).resolve().parents[1]))
+from rdna4_w4a16 import Library
 
 sys.path.insert(0, sys.argv[1])
 import torch  # noqa: E402
@@ -30,9 +33,8 @@ from vllm.model_executor.kernels.linear.mixed_precision import rdna_hybrid_w4a16
 from vllm.utils.platform_utils import num_compute_units  # noqa: E402
 
 device = torch.device("cuda:0")
-library = ctypes.CDLL(sys.argv[2])
-library.rdna4_w4a16_linear.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 4
-library.rdna4_w4a16_linear.restype = ctypes.c_int
+binding = Library(sys.argv[2])
+library = binding.raw
 GROUP = 32
 OURS_MAX_ROWS = 512
 COLD_BYTES = 768 << 20
@@ -115,7 +117,7 @@ class Shape:
         if impl == "ours":
             def make(w, s, z):
                 args = (w.data_ptr(), s.data_ptr(), z.data_ptr(), x.data_ptr(), y.data_ptr(), n, k, GROUP, m)
-                return lambda: library.rdna4_w4a16_linear(*args)
+                return lambda: library.w4a16_linear(*args)
             return [make(*c) for c in copies]
         if impl == "vllm":
             return [lambda w=w, s=s, z=z: hybrid._rdna_hybrid_w4a16_apply_impl(x, w, s, z, None, CU, GROUP) for w, s, z in copies]

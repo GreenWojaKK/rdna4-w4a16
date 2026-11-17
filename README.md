@@ -115,12 +115,13 @@ Replies use the same structure as `model.system_one`. Serialize calls for each l
 
 The reference `Int4Linear` implementation dequantizes the entire weight matrix to BF16 on each call, then multiplies it by the input. At small input row counts, writing and reading the dequantized matrix dominates that path.
 
-The [kernel library](kernels/int4_linear.hip) computes `y = x Wᵀ` from the packed weights. `rdna4_w4a16_route` selects the implementation from the input rows, layer shape, input dtype and bias:
+The [kernel library](kernels/int4_linear.hip) computes `y = x Wᵀ` from the packed weights. `w4a16_route` selects the implementation from the input rows, layer shape, input dtype and bias:
 
 | Input rows | Implementation |
 |---|---|
 | 1 | Dot-product kernel. A wave takes one weight row; each lane reads one 32-column group per step, so the wave reads 512 contiguous bytes of the row. Lanes dequantize in registers, accumulate with the BF16 dot-product instruction and reduce at the end |
-| 2–512 | Matrix kernel. A workgroup dequantizes one or two 16-row weight tiles, 512 columns at a time, into shared memory. Each wave multiplies a 16-row input tile with 16×16×16 BF16 matrix instructions |
+| 2–512 | Matrix kernel. A workgroup dequantizes 16-row weight tiles, 512 columns at a time, into shared memory: one tile below 48 input rows, two from 48 rows when the output width is a multiple of 32. Each wave multiplies a 16-row input tile with 16×16×16 BF16 matrix instructions |
+| 48–128 | The matrix kernel with two weight tiles, reading ahead. A workgroup reads the next unit's packed weights while it multiplies the current unit, each wave reads its input before the products that use it, and barriers wait for shared memory only. Each wave takes three input tiles (48 rows) or two (49–128 rows), skipping a last tile with no rows, so each decoded weight fragment feeds several products; eight waves (48 rows) or four (49–128 rows) split each group's columns and add their sums at the end. When a weight row is a multiple of 8192 columns (of 2048 up to 64 rows), each workgroup starts at its own unit so that workgroups do not read the same memory channels at once. Dequantization goes through FP16 |
 | Other | Not taken; the route returns the reason, and the caller runs its reference path |
 
 Both kernels compute each weight as `(nibble - zero_point) * scale` rounded to BF16, as the reference layer does, and accumulate in FP32. Outputs differ from the reference layer only by accumulation order.
@@ -136,16 +137,26 @@ Both kernels compute each weight as `(nibble - zero_point) * scale` rounded to B
 
 ### C ABI
 
-All functions run on the current device's default stream.
+[kernels/api.h](kernels/api.h) is the public C-compatible header. It defines every exported function, status, path, dtype and fallback reason without requiring HIP headers. The library reports **ABI version 2** through `w4a16_abi_version()`. Clients check that version before calling other functions. The developer record format remains schema 2.
 
 | Function | Result |
 |---|---|
-| `rdna4_w4a16_linear(packed, scale, zero, x, y, out, in, group, rows)` | Writes `y [rows, out]`; returns 0, or minus the reason when no kernel takes the product |
-| `rdna4_w4a16_route(out, in, group, rows, dtype, bias)` | The implementation a product takes, above zero, or minus the reason it falls back: rows, dtype, bias, shape or launch |
-| `rdna4_w4a16_dev_start(path, every)` | Starts the developer mode and its record file |
-| `rdna4_w4a16_dev_span_begin(name, rows, tokens)`, `rdna4_w4a16_dev_span_end()` | Opens and closes a span of the caller's work under a name |
-| `rdna4_w4a16_dev_op_begin(...)`, `rdna4_w4a16_dev_op_end()` | Marks a product the caller runs itself, such as its reference path or a dense head |
-| `rdna4_w4a16_dev_finish()` | Writes the summary and returns it |
+| `w4a16_abi_version()` | ABI version |
+| `w4a16_status_string(status)` | Static English description of a status |
+| `w4a16_route(out, in, group, rows, dtype, bias)` | Positive kernel path, or a negative status explaining rejection |
+| `w4a16_linear(packed, scale, zero, x, y, out, in, group, rows)` | Enqueues the product; returns `STATUS_OK` or a negative status |
+| `w4a16_record_begin(path, every)` | Starts the recorder and opens its file |
+| `w4a16_span_begin(name, rows, tokens)`, `w4a16_span_end()` | Opens and closes a caller-named span |
+| `w4a16_op_begin(...)`, `w4a16_op_end()` | Records a caller-run fallback or dense head |
+| `w4a16_record_end(&summary)` | Closes recording; returns a status and a library-owned JSON string |
+
+Status values are shared across functions: `0` is success; `-1` through `-5` identify rows, dtype, bias, shape and launch failures; `-6` is an invalid argument, `-7` an invalid recorder state, `-8` file I/O failure and `-9` device initialization or synchronization failure. Route's positive values identify implementations. Callers may fall back for unsupported products; malformed calls require correction.
+
+BF16 buffers use `uint16_t*` to express their stored bits. The header specifies each buffer's dimensions and alignment. Callers own the contiguous device storage, keep it alive until execution completes, and provide non-overlapping output storage. All GPU operations use the current device's **default stream**; callers explicitly order work on other streams. A successful product call means the launch was enqueued. Asynchronous GPU errors are checked when the caller synchronizes.
+
+The recorder is process-global. While recording, use one host thread, keep the current device unchanged, and serialize library calls. Spans cannot nest. Nested products belong to the outer product; balance begin/end before ending a span. `record_end` closes an open span and returns text valid until the next recorder start. Copy that text before starting another recording.
+
+[rdna4_w4a16.py](rdna4_w4a16.py) provides the Python `Library` binding and raises errors with the library's status description. Its declarations and enum values in `_rdna4_w4a16_abi.py` are generated from the public header by `tools/generate_binding.py`; its `--check` option reports declarations that no longer match the header. Distribute both Python files with the shared library. Dplus's build script copies all three files beside its executable.
 
 ### Developer mode
 
@@ -157,13 +168,10 @@ The record file is JSONL: the run, one line per span, then the summary. [kernels
 cargo run --manifest-path record/Cargo.toml -- run.dev.jsonl
 ```
 
-### Build and check
+### Build
 
 ```sh
 RDNA4_W4A16_PYTHON="$PYTHON" tools/build_kernels.sh
-RDNA4_W4A16_PYTHON="$PYTHON" tools/check.sh
-"$PYTHON" tools/check_kernels.py models/d3-ultra-INT4 dist/librdna4_w4a16.so
-"$PYTHON" tools/check_dev.py models/d3-ultra-INT4 dist/librdna4_w4a16.so record/tests/fixtures/check.dev.jsonl
 ```
 
 On Windows, in PowerShell:
@@ -177,9 +185,6 @@ tools\build_kernels.ps1
 |---|---|
 | [tools/build_kernels.sh](tools/build_kernels.sh) | Builds `dist/librdna4_w4a16.so` with the HIP compiler of the ROCm SDK in the selected environment. `RDNA4_W4A16_GPU_ARCH` selects the architecture; the default is `gfx1201` |
 | [tools/build_kernels.ps1](tools/build_kernels.ps1) | Builds `dist/rdna4_w4a16.dll` and its import library on Windows in the same way. A process that loads the DLL needs the SDK's `bin` folder, which holds the HIP runtime and its DLLs, on its `PATH` |
-| [tools/check.sh](tools/check.sh) | Builds the library, then checks the record crate's formatting, lints and tests |
-| [tools/check_kernels.py](tools/check_kernels.py) | Compares the kernels with the reference `Int4Linear` on random weights of the d3-ultra-INT4 layer shapes: output differences and times |
-| [tools/check_dev.py](tools/check_dev.py) | Runs the developer mode on known calls, checks the record against them, and writes the record the crate's tests read |
 
 ## Measurements and experiment history
 

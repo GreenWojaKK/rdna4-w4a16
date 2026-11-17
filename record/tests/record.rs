@@ -1,11 +1,11 @@
-//! Reads a record file the kernel library wrote on the device (`tools/check_dev.py`), and lines that break the
+//! Reads a record file the kernel library wrote on the device, and lines that break the
 //! format.
 
 use rdna4_w4a16_record::{Dtype, Op, Path, ReadError, Reason, Record, parse, parse_line};
 
 const RECORDED: &str = include_str!("fixtures/check.dev.jsonl");
 
-/// The file of `tools/check_dev.py`: two spans in each of four phases, the second timing its int4 products, each
+/// The record the device check wrote: two spans in each of four phases, the second timing its int4 products, each
 /// over 40 rounds of three layers; the decode and prefill spans end with the head.
 #[test]
 fn a_recorded_file_reads_and_its_summary_matches_its_spans() {

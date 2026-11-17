@@ -11,7 +11,7 @@ mkdir -p "$root/dist"
 objects=$(mktemp -d)
 trap 'rm -rf "$objects"' EXIT
 export ROCM_PATH="$sdk" HIP_DEVICE_LIB_PATH="$sdk/lib/llvm/amdgcn/bitcode" DEVICE_LIB_PATH="$sdk/lib/llvm/amdgcn/bitcode"
-flags=(-O3 -std=c++20 -fPIC -I"$sdk/include")
+flags=(-DRDNA4_W4A16_BUILD -fvisibility=hidden -O3 -std=c++20 -fPIC -I"$sdk/include")
 "$sdk/bin/hipcc" "${flags[@]}" -fno-gpu-rdc --offload-arch="$arch" -c "$root/kernels/int4_linear.hip" -o "$objects/int4_linear.o"
 # The developer mode runs on the host only, and marks its spans and timed products as ROCTx ranges.
 c++ "${flags[@]}" -D__HIP_PLATFORM_AMD__ -DRDNA4_W4A16_ROCTX=1 -Wall -Wextra -c "$root/kernels/instrument.cpp" -o "$objects/instrument.o"

@@ -16,7 +16,7 @@ New-Item -ItemType Directory $objects | Out-Null
 $env:HIP_PATH = $sdk
 $env:ROCM_PATH = $sdk
 $env:HIP_DEVICE_LIB_PATH = "$sdk\lib\llvm\amdgcn\bitcode"
-$flags = @('-O3', '-std=c++20', "-I$sdk\include")
+$flags = @('-DRDNA4_W4A16_BUILD', '-O3', '-std=c++20', "-I$sdk\include")
 
 # A compiler's warnings on stderr are not failures; its exit code tells.
 function Run([string]$program, [string[]]$arguments) {

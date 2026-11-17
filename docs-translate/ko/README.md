@@ -115,12 +115,13 @@ print(labels["answers"]["object"]["choice"])
 
 기준 `Int4Linear` 구현은 호출마다 가중치 행렬 전체를 BF16으로 dequantize한 뒤 입력과 곱한다. 입력 행 수가 작으면 dequantize한 행렬을 쓰고 읽는 시간이 이 경로의 대부분을 차지한다.
 
-[Kernel 라이브러리](../../kernels/int4_linear.hip)는 packed 가중치에서 `y = x Wᵀ`를 계산한다. `rdna4_w4a16_route`는 입력 행 수, layer shape, 입력 dtype과 bias로 구현을 고른다.
+[Kernel 라이브러리](../../kernels/int4_linear.hip)는 packed 가중치에서 `y = x Wᵀ`를 계산한다. `w4a16_route`는 입력 행 수, layer shape, 입력 dtype과 bias로 구현을 고른다.
 
 | 입력 행 수 | 구현 |
 |---|---|
 | 1 | Dot-product kernel. Wave 하나가 가중치 한 행을 맡고, 각 lane이 step마다 32열 group 하나를 읽어 wave가 그 행의 연속 512바이트를 읽는다. Lane은 register에서 dequantize하고 BF16 dot-product instruction으로 누산한 뒤 마지막에 합산한다 |
-| 2–512 | Matrix kernel. Workgroup이 16행 weight tile 하나 또는 둘을 512열씩 공유 메모리로 dequantize한다. 각 wave는 16행 입력 tile을 16×16×16 BF16 matrix instruction으로 곱한다 |
+| 2–512 | Matrix kernel. Workgroup이 16행 weight tile을 512열씩 공유 메모리로 dequantize한다. 입력 48행 미만에서는 tile 하나, 48행부터는 출력 폭이 32의 배수일 때 tile 둘이다. 각 wave는 16행 입력 tile을 16×16×16 BF16 matrix instruction으로 곱한다 |
+| 48–128 | Tile 둘을 쓰는 matrix kernel이 미리 읽는다. Workgroup은 현재 unit을 곱하는 동안 다음 unit의 packed 가중치를 읽고, 각 wave는 입력을 그 입력을 쓰는 곱셈보다 먼저 읽으며, barrier는 공유 메모리만 기다린다. Wave 하나가 입력 tile 셋(48행)이나 둘(49~128행)을 맡고 행이 없는 마지막 tile은 건너뛰어, decode한 가중치 조각 하나를 여러 곱셈에 쓴다. Wave 여덟(48행)이나 넷(49~128행)이 묶음의 열을 나눠 맡고 마지막에 합을 더한다. 가중치 한 행이 8192열의 배수(64행까지는 2048열의 배수)면, workgroup들이 같은 메모리 channel을 동시에 읽지 않도록 workgroup마다 다른 unit에서 시작한다. Dequantize는 FP16을 거친다 |
 | 그 밖 | 사용하지 않는다. Route가 사유를 반환하고 호출자가 기준 경로를 실행한다 |
 
 두 kernel 모두 기준 layer와 같이 각 가중치를 `(nibble - zero_point) * scale`로 계산해 BF16으로 반올림하고 FP32로 누산한다. 출력은 누산 순서에 따른 차이만 있다.
@@ -136,16 +137,26 @@ print(labels["answers"]["object"]["choice"])
 
 ### C ABI
 
-모든 함수는 현재 장치의 default stream에서 실행한다.
+[kernels/api.h](../../kernels/api.h)는 HIP 헤더 없이 사용할 수 있는 공개 C 헤더다. 모든 export 함수, status, 실행 경로, dtype과 fallback 사유를 정의한다. 라이브러리는 `w4a16_abi_version()`으로 **ABI version 2**를 반환한다. 호출자는 다른 함수를 쓰기 전에 이 버전을 확인한다. 개발자 기록 형식은 schema 2를 유지한다.
 
 | 함수 | 결과 |
 |---|---|
-| `rdna4_w4a16_linear(packed, scale, zero, x, y, out, in, group, rows)` | `y [rows, out]`를 쓴다. 0을 반환하고, kernel이 받지 않는 곱셈이면 사유에 음수를 붙여 반환한다 |
-| `rdna4_w4a16_route(out, in, group, rows, dtype, bias)` | 곱셈이 쓰는 구현(양수) 또는 fallback 사유(음수): rows, dtype, bias, shape, launch |
-| `rdna4_w4a16_dev_start(path, every)` | 개발자 모드와 기록 파일을 시작한다 |
-| `rdna4_w4a16_dev_span_begin(name, rows, tokens)`, `rdna4_w4a16_dev_span_end()` | 호출자의 작업 한 단위를 이름을 붙여 열고 닫는다 |
-| `rdna4_w4a16_dev_op_begin(...)`, `rdna4_w4a16_dev_op_end()` | 호출자가 직접 실행하는 곱셈(기준 경로, dense head 등)을 표시한다 |
-| `rdna4_w4a16_dev_finish()` | 요약을 쓰고 반환한다 |
+| `w4a16_abi_version()` | ABI 버전 |
+| `w4a16_status_string(status)` | 정적 영어 status 설명 |
+| `w4a16_route(out, in, group, rows, dtype, bias)` | 양수 kernel 경로 또는 거절 사유를 나타내는 음수 status |
+| `w4a16_linear(packed, scale, zero, x, y, out, in, group, rows)` | 행렬곱을 enqueue하고 `STATUS_OK` 또는 음수 status 반환 |
+| `w4a16_record_begin(path, every)` | Recorder 시작 및 기록 파일 열기 |
+| `w4a16_span_begin(name, rows, tokens)`, `w4a16_span_end()` | 호출자가 이름 붙인 span 시작·종료 |
+| `w4a16_op_begin(...)`, `w4a16_op_end()` | 호출자가 실행한 fallback 또는 dense head 기록 |
+| `w4a16_record_end(&summary)` | 기록을 종료하고 status와 라이브러리 소유 JSON 문자열 반환 |
+
+모든 함수가 같은 status 값을 쓴다. `0`은 성공, `-1`부터 `-5`는 rows·dtype·bias·shape·launch 실패, `-6`은 잘못된 인자, `-7`은 잘못된 recorder 상태, `-8`은 파일 I/O 실패, `-9`는 장치 초기화 또는 동기화 실패다. Route의 양수는 구현을 나타낸다. 지원하지 않는 행렬곱은 호출자가 fallback할 수 있으며, 잘못된 호출은 인자를 수정해야 한다.
+
+BF16 버퍼는 저장된 비트를 나타내는 `uint16_t*`로 선언한다. 각 버퍼의 크기와 정렬 조건은 헤더에 명시한다. 호출자는 연속된 device storage를 소유하고 실행이 끝날 때까지 유지하며, 출력 버퍼는 입력과 겹치지 않게 제공한다. 모든 GPU 연산은 현재 장치의 **default stream**을 사용한다. 다른 stream과의 실행 순서는 호출자가 명시적으로 연결한다. 행렬곱 호출 성공은 launch가 enqueue됐음을 나타내며, 비동기 GPU 오류는 호출자가 동기화할 때 확인한다.
+
+Recorder는 프로세스 전체에서 하나다. 기록 중에는 한 host thread에서 호출을 직렬화하고 현재 장치를 유지한다. Span은 중첩하지 않는다. 중첩된 product는 바깥 product에 포함되며, span 종료 전에 begin/end를 맞춘다. `record_end`는 열린 span을 닫고 다음 recorder 시작까지 유효한 문자열을 반환한다. 다음 기록을 시작하기 전에 문자열을 복사한다.
+
+[rdna4_w4a16.py](../../rdna4_w4a16.py)의 Python `Library` binding은 라이브러리의 status 설명을 담은 오류를 발생시킨다. `_rdna4_w4a16_abi.py`의 선언과 enum 값은 `tools/generate_binding.py`가 공개 헤더에서 생성하며, 그 `--check` 옵션은 헤더와 맞지 않는 선언을 알린다. 두 Python 파일을 공유 라이브러리와 함께 배포한다. Dplus의 빌드 스크립트는 세 파일을 실행 파일 옆에 복사한다.
 
 ### 개발자 모드
 
@@ -157,13 +168,10 @@ Recorder는 span마다 HIP event로 장치 시간을 재고, 그 안의 곱셈�
 cargo run --manifest-path record/Cargo.toml -- run.dev.jsonl
 ```
 
-### 빌드와 검사
+### 빌드
 
 ```sh
 RDNA4_W4A16_PYTHON="$PYTHON" tools/build_kernels.sh
-RDNA4_W4A16_PYTHON="$PYTHON" tools/check.sh
-"$PYTHON" tools/check_kernels.py models/d3-ultra-INT4 dist/librdna4_w4a16.so
-"$PYTHON" tools/check_dev.py models/d3-ultra-INT4 dist/librdna4_w4a16.so record/tests/fixtures/check.dev.jsonl
 ```
 
 Windows에서는 PowerShell에서 실행한다.
@@ -177,9 +185,6 @@ tools\build_kernels.ps1
 |---|---|
 | [tools/build_kernels.sh](../../tools/build_kernels.sh) | 선택한 환경의 ROCm SDK HIP compiler로 `dist/librdna4_w4a16.so`를 빌드한다. `RDNA4_W4A16_GPU_ARCH`로 architecture를 지정하며 기본값은 `gfx1201`이다 |
 | [tools/build_kernels.ps1](../../tools/build_kernels.ps1) | Windows에서 같은 방식으로 `dist/rdna4_w4a16.dll`과 import library를 빌드한다. DLL을 로드하는 프로세스는 HIP runtime과 그 DLL이 있는 SDK의 `bin` 폴더를 `PATH`에 둔다 |
-| [tools/check.sh](../../tools/check.sh) | 라이브러리를 빌드한 뒤 record crate의 formatting, lint와 테스트를 검사한다 |
-| [tools/check_kernels.py](../../tools/check_kernels.py) | d3-ultra-INT4 layer shape의 무작위 가중치로 kernel과 기준 `Int4Linear`를 비교한다: 출력 차이와 시간 |
-| [tools/check_dev.py](../../tools/check_dev.py) | 알려진 호출로 개발자 모드를 실행해 기록을 대조하고, crate 테스트가 읽는 기록을 쓴다 |
 
 ## 측정과 실험 경위
 

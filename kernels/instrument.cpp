@@ -41,6 +41,7 @@ static int roctxRangePop() { return 0; }
 #include <cstddef>
 #include <cstdio>
 #include <format>
+#include <filesystem>
 #include <limits>
 #include <map>
 #include <string>
@@ -129,6 +130,7 @@ struct PhaseTotal {
 struct State {
     std::FILE* file = nullptr;
     bool on = false;
+    bool io_failed = false;
     int every = 0;        // One span in every so many of a phase has its int4 products timed. None when zero.
     double event_ms = 0;  // What a pair of events adds to the time of what lies between them.
     double pair_ms = 0;   // What a timed product adds to the time of its span.
@@ -329,7 +331,7 @@ void close_span() {
         first = false;
     }
     line += "]}\n";
-    std::fputs(line.c_str(), state.file);
+    state.io_failed |= std::fputs(line.c_str(), state.file) < 0 || std::fflush(state.file) != 0;
     if (state.span_timed) {
         ++total.timed_spans;
         total.timed_gpu_ms += gpu;
@@ -438,46 +440,81 @@ void end() {
 
 extern "C" {
 
+RDNA4_W4A16_API uint32_t w4a16_abi_version(void) { return RDNA4_W4A16_ABI_VERSION; }
+
+RDNA4_W4A16_API const char* w4a16_status_string(int32_t status) {
+    switch (status) {
+        case RDNA4_W4A16_STATUS_OK: return "success";
+        case RDNA4_W4A16_STATUS_ROWS: return "unsupported input row count";
+        case RDNA4_W4A16_STATUS_DTYPE: return "unsupported input dtype";
+        case RDNA4_W4A16_STATUS_BIAS: return "bias is unsupported";
+        case RDNA4_W4A16_STATUS_SHAPE: return "unsupported layer shape or group size";
+        case RDNA4_W4A16_STATUS_LAUNCH: return "HIP kernel launch failed";
+        case RDNA4_W4A16_STATUS_ARGUMENT: return "invalid argument or buffer alignment";
+        case RDNA4_W4A16_STATUS_STATE: return "invalid recorder state";
+        case RDNA4_W4A16_STATUS_IO: return "record file I/O failed";
+        case RDNA4_W4A16_STATUS_DEVICE: return "HIP device is unavailable or synchronization failed";
+        default: return "unknown status";
+    }
+}
+
 using namespace rdna4_w4a16::dev;
 
 // Starts the developer mode and its record file. One span in every `every` of a phase has its int4 products timed,
-// none when it is zero. Returns 0, -1 when the file cannot be written, -2 when the mode is on.
-RDNA4_W4A16_API int rdna4_w4a16_dev_start(const char* path, int every) {
+// none when it is zero. Returns a public status code.
+RDNA4_W4A16_API int w4a16_record_begin(const char* path, int every) {
     if (state.on) {
-        return -2;
+        return RDNA4_W4A16_STATUS_STATE;
     }
-    state = State{};
-    state.file = std::fopen(path, "w");
-    if (state.file == nullptr) {
-        return -1;
+    if (path == nullptr || *path == '\0' || every < 0) {
+        return RDNA4_W4A16_STATUS_ARGUMENT;
     }
-    state.every = every > 0 ? every : 0;
     int device = 0;
     hipDeviceProp_t properties{};
-    std::string name = "unknown";
-    std::string arch;
-    if (hipGetDevice(&device) == hipSuccess && hipGetDeviceProperties(&properties, device) == hipSuccess) {
-        name = properties.name;
-        arch = properties.gcnArchName;
-        // The architecture name carries the device's feature flags after a colon.
-        arch = arch.substr(0, arch.find(':'));
+    if (hipGetDevice(&device) != hipSuccess || hipGetDeviceProperties(&properties, device) != hipSuccess ||
+        hipDeviceSynchronize() != hipSuccess) {
+        return RDNA4_W4A16_STATUS_DEVICE;
     }
-    (void)hipDeviceSynchronize();
+    state = State{};
+#ifdef _WIN32
+    const std::string_view bytes(path);
+    const std::u8string utf8(bytes.begin(), bytes.end());
+    state.file = _wfopen(std::filesystem::path(utf8).c_str(), L"w");
+#else
+    state.file = std::fopen(path, "w");
+#endif
+    if (state.file == nullptr) {
+        return RDNA4_W4A16_STATUS_IO;
+    }
+    state.every = every;
+    const std::string name = properties.name;
+    std::string arch = properties.gcnArchName;
+    // The architecture name carries the device's feature flags after a colon.
+    arch = arch.substr(0, arch.find(':'));
     calibrate();
     const auto now = std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now());
     const std::string line = std::format(R"({{"record":"run","schema":{},"started":"{:%FT%TZ}","device":"{}","arch":"{}","every":{},"event_ms":{:.4f},"pair_ms":{:.4f}}})",
                                          kSchema, now, escaped(name), escaped(arch), state.every, state.event_ms, state.pair_ms);
-    std::fputs((line + "\n").c_str(), state.file);
+    if (std::fputs((line + "\n").c_str(), state.file) < 0 || std::fflush(state.file) != 0) {
+        std::fclose(state.file);
+        state.file = nullptr;
+        for (const hipEvent_t event : state.spare) { (void)hipEventDestroy(event); }
+        state.spare.clear();
+        return RDNA4_W4A16_STATUS_IO;
+    }
     state.began = Clock::now();
     state.on = true;
     return 0;
 }
 
 // Opens a span: a piece of the caller's work, named `name`, over `rows` rows of `tokens` tokens in all. Spans of one
-// name form a phase. Returns 0, or -1 when the mode is off, the name is empty or a span is open.
-RDNA4_W4A16_API int rdna4_w4a16_dev_span_begin(const char* name, long long rows, long long tokens) {
-    if (!state.on || state.open || name == nullptr || *name == '\0') {
-        return -1;
+// name form a phase. Returns a public status code.
+RDNA4_W4A16_API int w4a16_span_begin(const char* name, int64_t rows, int64_t tokens) {
+    if (name == nullptr || *name == '\0' || rows < 0 || tokens < 0) {
+        return RDNA4_W4A16_STATUS_ARGUMENT;
+    }
+    if (!state.on || state.open || state.depth != 0) {
+        return RDNA4_W4A16_STATUS_STATE;
     }
     std::size_t phase = 0;
     while (phase < state.phases.size() && state.phases[phase].name != name) {
@@ -500,47 +537,53 @@ RDNA4_W4A16_API int rdna4_w4a16_dev_span_begin(const char* name, long long rows,
 }
 
 // Closes the open span once the device has reached its end, and writes its line.
-RDNA4_W4A16_API int rdna4_w4a16_dev_span_end(void) {
-    if (!state.on || !state.open) {
-        return -1;
+RDNA4_W4A16_API int w4a16_span_end(void) {
+    if (!state.on || !state.open || state.depth != 0) {
+        return RDNA4_W4A16_STATUS_STATE;
     }
     close_span();
-    return 0;
+    return state.io_failed ? RDNA4_W4A16_STATUS_IO : RDNA4_W4A16_STATUS_OK;
 }
 
 // The start of a product the caller runs itself: the checkpoint's own path of an int4 layer, or the head.
-RDNA4_W4A16_API int rdna4_w4a16_dev_op_begin(int op, int path, int reason, int m, int k, int n, int dtype) {
-    if (!within(op, kOpNames) || !within(path, kPathNames) || !within(reason, kReasonNames) || !within(dtype, kDtypeNames)) {
-        return -1;
+RDNA4_W4A16_API int w4a16_op_begin(int op, int path, int reason, int m, int k, int n, int dtype) {
+    if (!within(op, kOpNames) || !within(path, kPathNames) || !within(reason, kReasonNames) || !within(dtype, kDtypeNames) ||
+        m <= 0 || k <= 0 || n <= 0 ||
+        !((op == RDNA4_W4A16_OP_HEAD && path == RDNA4_W4A16_PATH_DENSE && reason == 0) ||
+          (op == RDNA4_W4A16_OP_INT4 && path == RDNA4_W4A16_PATH_UNPACK && reason > 0))) {
+        return RDNA4_W4A16_STATUS_ARGUMENT;
     }
     begin({static_cast<Op>(op), static_cast<Path>(path), static_cast<Reason>(reason), m, k, n, static_cast<Dtype>(dtype)});
     return 0;
 }
 
-RDNA4_W4A16_API int rdna4_w4a16_dev_op_end(void) {
+RDNA4_W4A16_API int w4a16_op_end(void) {
+    if (state.on && state.depth == 0) { return RDNA4_W4A16_STATUS_STATE; }
     end();
     return 0;
 }
 
 // Ends the developer mode: closes an open span, writes the summary as the file's last line and returns it. The text
-// stays valid until the mode starts again. Empty when the mode is off.
-RDNA4_W4A16_API const char* rdna4_w4a16_dev_finish(void) {
-    if (!state.on) {
-        return "";
-    }
+// stays valid until the mode starts again. The output is cleared on failure.
+RDNA4_W4A16_API int w4a16_record_end(const char** summary) {
+    if (summary == nullptr) { return RDNA4_W4A16_STATUS_ARGUMENT; }
+    *summary = nullptr;
+    if (!state.on || state.depth != 0) { return RDNA4_W4A16_STATUS_STATE; }
     if (state.open) {
         close_span();
     }
     state.summary = summary_line();
-    std::fputs((state.summary + "\n").c_str(), state.file);
-    std::fclose(state.file);
+    state.io_failed |= std::fputs((state.summary + "\n").c_str(), state.file) < 0;
+    state.io_failed |= std::fclose(state.file) != 0;
     state.file = nullptr;
     for (const hipEvent_t event : state.spare) {
         (void)hipEventDestroy(event);
     }
     state.spare.clear();
     state.on = false;
-    return state.summary.c_str();
+    if (state.io_failed) { return RDNA4_W4A16_STATUS_IO; }
+    *summary = state.summary.c_str();
+    return RDNA4_W4A16_STATUS_OK;
 }
 
 }  // extern "C"
